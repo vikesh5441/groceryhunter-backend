@@ -1,442 +1,403 @@
 /**
- * GroceryHunter ZA — Anti-Block Scraping Backend v2
+ * GroceryHunter ZA — Backend v5
+ * Uses Serper.dev Google Shopping API (2,500 free queries)
+ * to get REAL prices from SA stores via Google Shopping
  *
- * Bypass techniques used:
- * 1. Uses each store's INTERNAL mobile/app API endpoints (not website HTML)
- * 2. Rotates realistic User-Agent strings
- * 3. Sends full browser header sets including cookies placeholders
- * 4. Uses store-specific search APIs (Checkers Sixty60, PnP, Woolworths internal, SPAR Algolia)
- * 5. Price validation to reject nonsense values
- * 6. Falls back to Google Shopping search as last resort
+ * Setup:
+ *  1. Sign up free at serper.dev → get API key
+ *  2. Set SERPER_API_KEY in Render environment variables
+ *  3. Optional: SUPABASE_URL + SUPABASE_ANON_KEY for community prices
+ *
+ * Endpoints:
+ *   GET  /health
+ *   GET  /prices?q=milk+2l&city=Durban
+ *   POST /batch    { items:[], city:'' }
+ *   POST /submit   { product_name, store_id, price, city, user_id }
+ *   POST /ai-prices { items:[], apiKey:'' }
+ *   GET  /stats
  */
 
 const express   = require('express');
 const axios     = require('axios');
-const cheerio   = require('cheerio');
 const cors      = require('cors');
 const NodeCache = require('node-cache');
 
 const app   = express();
-const cache = new NodeCache({ stdTTL: 3600 });
+const cache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache
 const PORT  = process.env.PORT || 3000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Rotating User Agents ──────────────────────────────────────────────────────
-const UAS = [
-  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-  'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-];
-const randUA = () => UAS[Math.floor(Math.random() * UAS.length)];
+// ── Environment variables (set in Render dashboard) ───────────────────────────
+const SERPER_KEY = process.env.SERPER_API_KEY || 'e79f18b7e72aa89f5f50a31a998d83e536b36ec0;
+  
+const SUPABASE_URL = process.env.SUPABASE_URL    || '';
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
 
-// ── Base headers that mimic real browsers ─────────────────────────────────────
-const baseHeaders = () => ({
-  'User-Agent': randUA(),
-  'Accept-Language': 'en-ZA,en-GB;q=0.9,en;q=0.8',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Cache-Control': 'no-cache',
-  'Pragma': 'no-cache',
-  'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24"',
-  'sec-ch-ua-mobile': '?1',
-  'sec-ch-ua-platform': '"Android"',
-  'sec-fetch-dest': 'document',
-  'sec-fetch-mode': 'navigate',
-  'sec-fetch-site': 'none',
-  'upgrade-insecure-requests': '1',
-});
+const VALID_STORES = ['checkers','pnp','woolworths','spar','shoprite'];
 
-// ── Axios instance ─────────────────────────────────────────────────────────────
-const http = axios.create({ timeout: 15000, maxRedirects: 5 });
+// ── Store keyword matching ─────────────────────────────────────────────────────
+const STORE_KEYWORDS = {
+  checkers:   ['checkers','sixty60'],
+  pnp:        ['pick n pay','pnp','picknpay'],
+  woolworths: ['woolworths','woolies'],
+  spar:       ['spar','superspar'],
+  shoprite:   ['shoprite'],
+};
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+function matchStore(source) {
+  if (!source) return null;
+  const low = source.toLowerCase();
+  for (const [id, words] of Object.entries(STORE_KEYWORDS)) {
+    if (words.some(w => low.includes(w))) return id;
+  }
+  return null;
+}
+
 function parsePrice(str) {
   if (!str) return null;
-  const cleaned = String(str).replace(/[^\d.]/g, '');
-  const n = parseFloat(cleaned);
-  // Reject obviously wrong prices (below R2 or above R5000)
-  if (isNaN(n) || n < 2 || n > 5000) return null;
-  return Math.round(n * 100) / 100;
+  const n = parseFloat(String(str).replace(/[^\d.]/g,''));
+  return isNaN(n) || n < 2 || n > 5000 ? null : Math.round(n * 100) / 100;
 }
 
-function makeResult(name, price, url, store) {
-  if (!name || !price) return null;
-  const n = name.trim().replace(/\s+/g, ' ').slice(0, 80);
-  if (n.length < 2) return null;
-  return { name: n, price, url, store };
+function emptyResults() {
+  const e = {}; VALID_STORES.forEach(s => { e[s] = []; }); return e;
 }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// ── Supabase helper ───────────────────────────────────────────────────────────
+async function sb(method, path, body, params) {
+  const res = await axios({
+    method,
+    url: `${SUPABASE_URL}/rest/v1${path}${params?'?'+params:''}`,
+    data: body,
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': method==='POST' ? 'return=representation' : undefined,
+    },
+    timeout: 10000,
+  });
+  return res.data;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  STORE SCRAPERS — using internal APIs where possible
+//  SERPER GOOGLE SHOPPING SCRAPER
+//  Uses Serper.dev API which handles all anti-bot bypassing for Google
 // ═══════════════════════════════════════════════════════════════════════════════
+async function searchGoogleShopping(query) {
+  if (!SERPER_KEY) {
+    console.log('No SERPER_API_KEY set — skipping Google Shopping');
+    return null;
+  }
 
-// ── CHECKERS — uses Sixty60 internal API ──────────────────────────────────────
-async function scrapeCheckers(query) {
-  // Method 1: Checkers Sixty60 app API (most reliable)
   try {
-    const { data } = await http.get(
-      `https://api.sixty60.co.za/api/v1/products/search?q=${encodeURIComponent(query)}&store_id=1&limit=8`,
-      { headers: { ...baseHeaders(), Accept: 'application/json', Origin: 'https://sixty60.co.za', Referer: 'https://sixty60.co.za/' } }
-    );
-    const products = data?.data?.products || data?.products || [];
-    const mapped = products.slice(0, 8).map(p => {
-      const price = parsePrice(p.price || p.selling_price || p.pricePerUnit);
-      return makeResult(p.name || p.title, price, `https://www.checkers.co.za`, 'checkers');
-    }).filter(Boolean);
-    if (mapped.length) { console.log(`Checkers Sixty60 API: ${mapped.length} results`); return mapped; }
-  } catch (e) { console.log('Checkers Sixty60 failed:', e.message); }
+    console.log(`[SERPER] Shopping search: "${query}"`);
 
-  // Method 2: Checkers website with full browser headers
-  try {
-    const url = `https://www.checkers.co.za/search?query=${encodeURIComponent(query)}`;
-    const { data: html } = await http.get(url, {
-      headers: {
-        ...baseHeaders(),
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        Referer: 'https://www.checkers.co.za/',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'same-origin',
-      }
-    });
-    const $ = cheerio.load(html);
-    const raw = $('#__NEXT_DATA__').text();
-    if (raw) {
-      const json = JSON.parse(raw);
-      const products =
-        json?.props?.pageProps?.searchResult?.products ||
-        json?.props?.pageProps?.initialData?.products || [];
-      const mapped = products.slice(0, 8).map(p => {
-        const price = parsePrice(String(p.price?.currentPrice ?? p.currentPrice ?? ''));
-        return makeResult(p.name || p.title, price, `https://www.checkers.co.za/product/${p.productId || ''}`, 'checkers');
-      }).filter(Boolean);
-      if (mapped.length) { console.log(`Checkers website: ${mapped.length} results`); return mapped; }
-    }
-  } catch (e) { console.log('Checkers website failed:', e.message); }
-
-  return [];
-}
-
-// ── PICK N PAY — uses PnP internal search API ─────────────────────────────────
-async function scrapePnP(query) {
-  // Method 1: PnP internal API
-  try {
-    const { data } = await http.get(
-      `https://www.pnp.co.za/pnpstorefront/pnp/en/search?q=${encodeURIComponent(query)}&format=json&pageSize=8`,
+    const { data } = await axios.post(
+      'https://google.serper.dev/shopping',
       {
-        headers: {
-          ...baseHeaders(),
-          Accept: 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: 'https://www.pnp.co.za/',
-        }
-      }
-    );
-    const products = data?.products || data?.results || [];
-    const mapped = products.slice(0, 8).map(p => {
-      const price = parsePrice(p.price?.value || p.price || p.priceData?.value);
-      return makeResult(p.name, price, `https://www.pnp.co.za${p.url || ''}`, 'pnp');
-    }).filter(Boolean);
-    if (mapped.length) { console.log(`PnP internal API: ${mapped.length} results`); return mapped; }
-  } catch (e) { console.log('PnP internal API failed:', e.message); }
-
-  // Method 2: PnP website scrape
-  try {
-    const url = `https://www.pnp.co.za/search?q=${encodeURIComponent(query)}`;
-    const { data: html } = await http.get(url, {
-      headers: {
-        ...baseHeaders(),
-        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-        Referer: 'https://www.pnp.co.za/',
-      }
-    });
-    const $ = cheerio.load(html);
-    // Look for JSON in script tags
-    let found = [];
-    $('script').each((_, el) => {
-      const txt = $(el).html() || '';
-      if (txt.includes('"price"') && txt.includes('"name"') && txt.length < 500000) {
-        const matches = [...txt.matchAll(/"name"\s*:\s*"([^"]{3,80})","[^"]*"[^}]*"price"\s*:\s*"?(\d+\.?\d*)"/g)];
-        matches.forEach(m => {
-          const price = parsePrice(m[2]);
-          const r = makeResult(m[1], price, url, 'pnp');
-          if (r) found.push(r);
-        });
-      }
-    });
-    if (found.length) { console.log(`PnP script scrape: ${found.length} results`); return found.slice(0, 8); }
-
-    // HTML fallback
-    const results = [];
-    $('[class*="product"],[class*="Product"]').each((_, el) => {
-      const name  = $(el).find('[class*="name"],[class*="title"],h2,h3').first().text().trim();
-      const price = parsePrice($(el).find('[class*="price"],[class*="Price"]').first().text());
-      const r = makeResult(name, price, url, 'pnp');
-      if (r) results.push(r);
-    });
-    if (results.length) { console.log(`PnP HTML fallback: ${results.length} results`); return results.slice(0, 8); }
-  } catch (e) { console.log('PnP website failed:', e.message); }
-
-  return [];
-}
-
-// ── WOOLWORTHS — uses their internal search API ───────────────────────────────
-async function scrapeWoolworths(query) {
-  // Method 1: WW internal JSON API
-  try {
-    const { data } = await http.get(
-      `https://www.woolworths.co.za/server/searchCategory?No=0&Nrpp=10&Ntt=${encodeURIComponent(query)}&selectedCategory=&sortBy=&root=false`,
-      {
-        headers: {
-          ...baseHeaders(),
-          Accept: 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: 'https://www.woolworths.co.za/',
-          Origin: 'https://www.woolworths.co.za',
-        }
-      }
-    );
-    const products =
-      data?.products?.products ||
-      data?.contents?.[0]?.mainContent?.[0]?.contents?.[0]?.records || [];
-    const mapped = products.slice(0, 8).map(p => {
-      const rawPrice = p?.priceInfo?.price ?? p?.priceInfo?.wasPrice ?? p?.price?.formattedValue ?? '';
-      const price = parsePrice(String(rawPrice));
-      return makeResult(
-        p.displayName || p.name,
-        price,
-        `https://www.woolworths.co.za${p.UrlPath || ''}`,
-        'woolworths'
-      );
-    }).filter(Boolean);
-    if (mapped.length) { console.log(`Woolworths API: ${mapped.length} results`); return mapped; }
-  } catch (e) { console.log('Woolworths API failed:', e.message); }
-
-  // Method 2: WW website with delay
-  try {
-    await sleep(500);
-    const url = `https://www.woolworths.co.za/cat?Ntt=${encodeURIComponent(query)}`;
-    const { data: html } = await http.get(url, {
-      headers: {
-        ...baseHeaders(),
-        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-        Referer: 'https://www.woolworths.co.za/',
-      }
-    });
-    const $ = cheerio.load(html);
-    const results = [];
-    $('[class*="product"],[class*="Product"]').each((_, el) => {
-      const name  = $(el).find('[class*="name"],[class*="title"],h3').first().text().trim();
-      const price = parsePrice($(el).find('[class*="price"]').first().text());
-      const r = makeResult(name, price, url, 'woolworths');
-      if (r) results.push(r);
-    });
-    if (results.length) { console.log(`Woolworths HTML: ${results.length} results`); return results.slice(0, 8); }
-  } catch (e) { console.log('Woolworths website failed:', e.message); }
-
-  return [];
-}
-
-// ── SPAR — uses Algolia search API (most reliable) ────────────────────────────
-async function scrapeSpar(query) {
-  // Method 1: Algolia (SPAR's own search provider — very reliable)
-  try {
-    const { data } = await http.post(
-      'https://6jydrmhxmo-dsn.algolia.net/1/indexes/prod_spar_za_en/query',
-      {
-        query,
-        hitsPerPage: 8,
-        attributesToRetrieve: ['name', 'price', 'url', 'brand', 'unitSize', 'image'],
+        q: `${query} South Africa`,
+        gl: 'za',       // Country: South Africa
+        hl: 'en',       // Language: English
+        num: 20,        // Get up to 20 results
+        autocorrect: true,
       },
+      {
+        headers: {
+          'X-API-KEY': SERPER_KEY,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    const shoppingResults = data?.shopping || [];
+    console.log(`[SERPER] Got ${shoppingResults.length} results for "${query}"`);
+
+    const results = emptyResults();
+    let matched = 0;
+
+    shoppingResults.forEach(item => {
+      // Each item has: title, price, source, link, imageUrl, rating
+      const storeId = matchStore(item.source);
+      if (!storeId) return;
+
+      const price = parsePrice(item.price);
+      if (!price) return;
+
+      // Only add if we don't have this store yet (first result = best/most relevant)
+      if (results[storeId].length === 0) {
+        results[storeId].push({
+          name: (item.title || query).slice(0, 80),
+          price,
+          source: 'google_shopping',
+          link: item.link || '',
+          image: item.imageUrl || '',
+          rating: item.rating || null,
+        });
+        matched++;
+        console.log(`  ✅ ${storeId}: R${price} — ${item.title?.slice(0,40)}`);
+      }
+    });
+
+    // Log unmatched sources to help debug
+    const unmatched = shoppingResults
+      .filter(i => !matchStore(i.source))
+      .map(i => i.source)
+      .filter((v,i,a) => a.indexOf(v)===i)
+      .slice(0, 5);
+    if (unmatched.length) console.log(`  Unmatched sources: ${unmatched.join(', ')}`);
+
+    return matched > 0 ? results : null;
+
+  } catch (e) {
+    console.error('[SERPER] Error:', e.response?.status, e.message);
+    return null;
+  }
+}
+
+// ── SPAR Algolia fallback (always free, always works) ─────────────────────────
+async function getSparFallback(query) {
+  try {
+    const { data } = await axios.post(
+      'https://6jydrmhxmo-dsn.algolia.net/1/indexes/prod_spar_za_en/query',
+      { query, hitsPerPage: 1, attributesToRetrieve: ['name','price'] },
       {
         headers: {
           'Content-Type': 'application/json',
           'X-Algolia-Application-Id': '6JYDRMHXMO',
           'X-Algolia-API-Key': 'YjA5MDM3OWQ3MzRmNzBjY2Q5YmQ2NTkxNTIzYWY4ZmIwMzYyNTVlNzRhNWQzMGM0Y2IwMWUxZWJiMGMzOGZpbHRlcnM9',
-          Origin: 'https://www.spar.co.za',
-          Referer: 'https://www.spar.co.za/',
-        }
+        },
+        timeout: 8000,
       }
     );
-    const hits = data?.hits || [];
-    const mapped = hits.slice(0, 8).map(h => {
-      const price = parsePrice(String(h.price || ''));
-      return makeResult(h.name, price, h.url ? `https://www.spar.co.za${h.url}` : 'https://www.spar.co.za', 'spar');
-    }).filter(Boolean);
-    if (mapped.length) { console.log(`SPAR Algolia: ${mapped.length} results`); return mapped; }
-  } catch (e) { console.log('SPAR Algolia failed:', e.message); }
+    const hit = data?.hits?.[0];
+    if (!hit?.price || parseFloat(hit.price) < 2) return null;
 
-  // Method 2: SPAR website
-  try {
-    const url = `https://www.spar.co.za/search?q=${encodeURIComponent(query)}`;
-    const { data: html } = await http.get(url, {
-      headers: { ...baseHeaders(), Referer: 'https://www.spar.co.za/' }
-    });
-    const $ = cheerio.load(html);
-    const results = [];
-    $('[class*="product"],[class*="Product"]').each((_, el) => {
-      const name  = $(el).find('[class*="name"],[class*="title"],h3,h4').first().text().trim();
-      const price = parsePrice($(el).find('[class*="price"]').first().text());
-      const r = makeResult(name, price, url, 'spar');
-      if (r) results.push(r);
-    });
-    if (results.length) { console.log(`SPAR HTML: ${results.length} results`); return results.slice(0, 8); }
-  } catch (e) { console.log('SPAR website failed:', e.message); }
+    const sp = parseFloat(hit.price);
+    const nm = hit.name || query;
+    const r  = n => Math.round(n * 100) / 100;
+    console.log(`[SPAR ALGOLIA] "${query}": R${sp}`);
 
-  return [];
+    return {
+      checkers:   [{ name:nm, price:r(sp*0.97), source:'spar_estimated' }],
+      pnp:        [{ name:nm, price:r(sp*0.98), source:'spar_estimated' }],
+      woolworths: [{ name:nm, price:r(sp*1.22), source:'spar_estimated' }],
+      spar:       [{ name:nm, price:sp,          source:'spar_api'       }],
+      shoprite:   [{ name:nm, price:r(sp*0.88), source:'spar_estimated' }],
+    };
+  } catch { return null; }
 }
 
-// ── SHOPRITE — uses their internal API ────────────────────────────────────────
-async function scrapeShoprite(query) {
-  // Method 1: Shoprite internal search API
+// ── Community prices from Supabase ────────────────────────────────────────────
+async function getCommunityPrices(productName, city) {
+  if (!SUPABASE_URL) return null;
   try {
-    const { data } = await http.get(
-      `https://www.shoprite.co.za/search?q=${encodeURIComponent(query)}&format=json`,
-      {
-        headers: {
-          ...baseHeaders(),
-          Accept: 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: 'https://www.shoprite.co.za/',
-        }
-      }
+    const ago = new Date(Date.now()-30*24*60*60*1000).toISOString();
+    const cityQ = city ? `&city=ilike.*${encodeURIComponent(city)}*` : '';
+    const data = await sb('GET', '/price_submissions', null,
+      `product_name=ilike.*${encodeURIComponent(productName)}*` +
+      `&created_at=gte.${ago}${cityQ}` +
+      `&select=store_id,price,product_name,created_at` +
+      `&order=created_at.desc&limit=50`
     );
-    const products = data?.products || data?.results || [];
-    const mapped = products.slice(0, 8).map(p => {
-      const price = parsePrice(p.price || p.priceValue || p.currentPrice);
-      return makeResult(p.name || p.title, price, `https://www.shoprite.co.za${p.url || ''}`, 'shoprite');
-    }).filter(Boolean);
-    if (mapped.length) { console.log(`Shoprite API: ${mapped.length} results`); return mapped; }
-  } catch (e) { console.log('Shoprite API failed:', e.message); }
+    if (!data?.length) return null;
 
-  // Method 2: Shoprite website with Next.js data
-  try {
-    const url = `https://www.shoprite.co.za/search?q=${encodeURIComponent(query)}`;
-    const { data: html } = await http.get(url, {
-      headers: {
-        ...baseHeaders(),
-        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-        Referer: 'https://www.shoprite.co.za/',
+    const byStore = {};
+    data.forEach(row => {
+      if (!byStore[row.store_id] ||
+          new Date(row.created_at) > new Date(byStore[row.store_id].created_at)) {
+        byStore[row.store_id] = row;
       }
     });
-    const $ = cheerio.load(html);
-    const raw = $('#__NEXT_DATA__').text();
-    if (raw) {
-      try {
-        const json = JSON.parse(raw);
-        const products =
-          json?.props?.pageProps?.searchResult?.products ||
-          json?.props?.pageProps?.products ||
-          json?.props?.pageProps?.initialData?.products || [];
-        const mapped = products.slice(0, 8).map(p => {
-          const price = parsePrice(String(p.price?.currentPrice ?? p.price ?? ''));
-          return makeResult(p.name || p.title, price, `https://www.shoprite.co.za${p.url || ''}`, 'shoprite');
-        }).filter(Boolean);
-        if (mapped.length) { console.log(`Shoprite Next.js: ${mapped.length} results`); return mapped; }
-      } catch {}
-    }
 
-    // HTML fallback
-    const results = [];
-    $('[class*="ProductCard"],[class*="product-card"],[class*="product"]').each((_, el) => {
-      const name  = $(el).find('[class*="name"],[class*="title"],h3,h2').first().text().trim();
-      const price = parsePrice($(el).find('[class*="price"]').first().text());
-      const r = makeResult(name, price, url, 'shoprite');
-      if (r) results.push(r);
+    const results = emptyResults();
+    let found = 0;
+    VALID_STORES.forEach(store => {
+      const row = byStore[store];
+      if (row) { results[store]=[{name:row.product_name,price:parseFloat(row.price),source:'community'}]; found++; }
     });
-    if (results.length) { console.log(`Shoprite HTML: ${results.length} results`); return results.slice(0, 8); }
-  } catch (e) { console.log('Shoprite website failed:', e.message); }
+    console.log(`[COMMUNITY] "${productName}": ${found} stores`);
+    return found > 0 ? results : null;
+  } catch (e) { console.error('Supabase error:', e.message); return null; }
+}
 
-  return [];
+// ── Get prices (priority: Community → Google Shopping → SPAR estimate) ────────
+async function getPrices(query, city) {
+  // 1. Check community DB first (most accurate — real submitted prices)
+  const community = await getCommunityPrices(query, city);
+  if (community) return { results: community, source: 'community' };
+
+  // 2. Google Shopping via Serper (real Google data)
+  const google = await searchGoogleShopping(query);
+  if (google) return { results: google, source: 'google_shopping' };
+
+  // 3. SPAR Algolia + estimates (free fallback)
+  const spar = await getSparFallback(query);
+  if (spar) return { results: spar, source: 'spar_estimated' };
+
+  // 4. Nothing found
+  return { results: emptyResults(), source: 'none' };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'GroceryHunter ZA Scraper v2',
-    time: new Date().toISOString(),
-    stores: ['checkers', 'pnp', 'woolworths', 'spar', 'shoprite'],
-  });
-});
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  service: 'GroceryHunter ZA v5 — Google Shopping',
+  serper:   !!SERPER_KEY,
+  supabase: !!SUPABASE_URL,
+  time: new Date().toISOString(),
+}));
 
-app.get('/search', async (req, res) => {
+// Single product prices
+app.get('/prices', async (req, res) => {
   const query = (req.query.q || '').trim();
-  if (!query) return res.status(400).json({ error: 'Missing ?q= parameter' });
+  const city  = (req.query.city || '').trim();
+  if (!query) return res.status(400).json({ error: 'Missing ?q=' });
 
-  const cacheKey = query.toLowerCase();
+  const cacheKey = `${query.toLowerCase()}_${city.toLowerCase()}`;
   const cached = cache.get(cacheKey);
-  if (cached) { console.log(`[CACHE] ${query}`); return res.json({ ...cached, cached: true }); }
+  if (cached) return res.json({ ...cached, cached: true });
 
-  console.log(`[SEARCH] "${query}"`);
-  const start = Date.now();
-
-  // Run all scrapers concurrently with small stagger to avoid triggering rate limits
-  const [chk, pnp, woo, spr, shs] = await Promise.allSettled([
-    scrapeCheckers(query),
-    scrapePnP(query),
-    scrapeWoolworths(query),
-    scrapeSpar(query),
-    scrapeShoprite(query),
-  ]);
-
-  const results = {
-    checkers:   chk.status === 'fulfilled' ? chk.value : [],
-    pnp:        pnp.status === 'fulfilled' ? pnp.value : [],
-    woolworths: woo.status === 'fulfilled' ? woo.value : [],
-    spar:       spr.status === 'fulfilled' ? spr.value : [],
-    shoprite:   shs.status === 'fulfilled' ? shs.value : [],
-  };
-
+  const { results, source } = await getPrices(query, city);
   const total = Object.values(results).flat().length;
-  const ms = Date.now() - start;
-  console.log(`[DONE] "${query}" → ${total} products in ${ms}ms`);
-  Object.entries(results).forEach(([k,v]) => console.log(`  ${k}: ${v.length} results`));
-
-  const payload = { query, results, total, ms, timestamp: new Date().toISOString() };
+  const payload = { query, results, source, total, timestamp: new Date().toISOString() };
   if (total > 0) cache.set(cacheKey, payload);
   res.json(payload);
 });
 
+// Batch prices — all basket items in one request
 app.post('/batch', async (req, res) => {
   const items = (req.body.items || []).slice(0, 20);
+  const city  = req.body.city || '';
   if (!items.length) return res.status(400).json({ error: 'Missing items[]' });
 
-  console.log(`[BATCH] ${items.length} items`);
+  console.log(`[BATCH] ${items.length} items, city="${city}"`);
 
-  const results = await Promise.allSettled(items.map(async q => {
-    const cached = cache.get(q.toLowerCase());
-    if (cached) return { query: q, results: cached.results };
-    const [chk,pnp,woo,spr,shs] = await Promise.allSettled([
-      scrapeCheckers(q), scrapePnP(q), scrapeWoolworths(q), scrapeSpar(q), scrapeShoprite(q)
-    ]);
-    const r = {
-      checkers:   chk.status==='fulfilled' ? chk.value : [],
-      pnp:        pnp.status==='fulfilled' ? pnp.value : [],
-      woolworths: woo.status==='fulfilled' ? woo.value : [],
-      spar:       spr.status==='fulfilled' ? spr.value : [],
-      shoprite:   shs.status==='fulfilled' ? shs.value : [],
-    };
-    cache.set(q.toLowerCase(), { results: r });
-    return { query: q, results: r };
-  }));
+  // Process items with small delay to avoid hitting Serper rate limit
+  const batchResults = [];
+  for (const q of items) {
+    const cacheKey = `${q.toLowerCase()}_${city.toLowerCase()}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      batchResults.push({ query:q, results:cached.results, source:'cache' });
+    } else {
+      const { results, source } = await getPrices(q, city);
+      const payload = { results, source };
+      if (Object.values(results).flat().length > 0) cache.set(cacheKey, payload);
+      batchResults.push({ query:q, results, source });
+      // Small delay between Serper requests to be respectful
+      if (items.indexOf(q) < items.length - 1) await new Promise(r=>setTimeout(r,300));
+    }
+  }
 
-  res.json({
-    items: results.map(r => r.status === 'fulfilled' ? r.value : { error: r.reason?.message }),
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ items: batchResults, city, timestamp: new Date().toISOString() });
+});
+
+// Submit community price
+app.post('/submit', async (req, res) => {
+  const { product_name, store_id, price, city, province, lat, lng, user_id } = req.body;
+  if (!product_name?.trim())            return res.status(400).json({ error: 'Missing product_name' });
+  if (!VALID_STORES.includes(store_id)) return res.status(400).json({ error: `Invalid store. Use: ${VALID_STORES.join(', ')}` });
+  const p = parseFloat(price);
+  if (isNaN(p) || p < 2 || p > 5000)   return res.status(400).json({ error: 'Invalid price (R2–R5000)' });
+
+  const row = {
+    product_name: product_name.trim().slice(0,100), store_id,
+    price: Math.round(p*100)/100,
+    city:city?.trim()||null, province:province?.trim()||null,
+    lat:lat||null, lng:lng||null,
+    user_id:(user_id||'anonymous').slice(0,50),
+  };
+  console.log(`[SUBMIT] ${row.product_name} @ ${row.store_id} R${row.price} (${row.city||'?'})`);
+
+  if (!SUPABASE_URL) return res.json({ success:true, message:'Received (DB not configured)', row });
+
+  try {
+    const saved = await sb('POST', '/price_submissions', row);
+    // Bust cache
+    cache.keys().forEach(k=>{if(k.includes(row.product_name.toLowerCase().slice(0,8)))cache.del(k);});
+    res.json({ success:true, message:'Thank you! Price saved 🙏', id:saved?.[0]?.id });
+  } catch(e) {
+    res.status(500).json({ error:'Could not save: '+e.message });
+  }
+});
+
+// AI prices via Claude (server-side — no CORS)
+const AI_PROMPT = `You are a South African grocery price expert for March 2026.
+Return ONLY a JSON array — no markdown, no explanation.
+Format: [{"item":"Full Cream Milk 2L","checkers":24.99,"pnp":25.49,"woolworths":31.99,"spar":25.99,"shoprite":22.99}]
+Use realistic March 2026 ZAR prices with ~6% inflation since 2025.
+Shoprite 10-15% cheaper. Woolworths 20-30% pricier. PnP within 5% of Checkers.`;
+
+app.post('/ai-prices', async (req, res) => {
+  const { items, apiKey } = req.body;
+  if (!items?.length) return res.status(400).json({ error:'Missing items[]' });
+  if (!apiKey)        return res.status(400).json({ error:'Missing apiKey' });
+
+  const cacheKey = 'ai_'+items.map(i=>i.toLowerCase()).sort().join('|');
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json({ ...cached, cached:true });
+
+  try {
+    const response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      system: AI_PROMPT,
+      messages:[{ role:'user', content:`March 2026 ZAR prices:\n${items.map((i,n)=>`${n+1}. ${i}`).join('\n')}` }],
+    }, {
+      headers:{ 'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01' },
+      timeout:30000,
+    });
+
+    const text = response.data?.content?.map(c=>c.text||'').join('')||'[]';
+    const data = JSON.parse(text.replace(/```json|```/g,'').trim());
+    const results = {};
+    data.forEach(row => {
+      const sr = {};
+      VALID_STORES.forEach(s => {
+        const p = row[s];
+        sr[s] = (p!=null && parseFloat(p)>=2) ? [{name:row.item,price:parseFloat(p),source:'ai'}] : [];
+      });
+      results[row.item.toLowerCase()] = sr;
+    });
+    const payload = { results, source:'ai', timestamp:new Date().toISOString() };
+    cache.set(cacheKey, payload);
+    res.json(payload);
+  } catch(e) {
+    const s = e.response?.status;
+    if (s===401) return res.status(401).json({ error:'Invalid API key' });
+    if (s===429) return res.status(429).json({ error:'Rate limited — try again' });
+    res.status(500).json({ error:e.message });
+  }
+});
+
+// Stats
+app.get('/stats', async (req, res) => {
+  const stats = { cache_keys: cache.keys().length, serper: !!SERPER_KEY, supabase: !!SUPABASE_URL };
+  if (SUPABASE_URL) {
+    try {
+      const data = await sb('GET','/price_submissions',null,'select=product_name,city&limit=5000');
+      stats.submissions = data.length;
+      stats.products = new Set(data.map(r=>r.product_name)).size;
+      stats.cities   = new Set(data.filter(r=>r.city).map(r=>r.city)).size;
+    } catch {}
+  }
+  res.json(stats);
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🛒 GroceryHunter ZA Backend v2 — port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/health`);
-  console.log(`   Search: http://localhost:${PORT}/search?q=milk\n`);
+  console.log(`\n🛒 GroceryHunter ZA v5 — Google Shopping via Serper`);
+  console.log(`   Port:    ${PORT}`);
+  console.log(`   Serper:  ${SERPER_KEY ? '✅ Ready' : '⚠️  Set SERPER_API_KEY env var'}`);
+  console.log(`   Supabase:${SUPABASE_URL ? ' ✅ Ready' : ' ⚠️  Optional — set SUPABASE_URL + SUPABASE_ANON_KEY'}`);
+  console.log(`\n   GET  /prices?q=eggs+12pk&city=Durban`);
+  console.log(`   POST /batch   { items:[], city:'' }`);
+  console.log(`   POST /submit  { product_name, store_id, price, city }`);
+  console.log(`   POST /ai-prices { items:[], apiKey:'' }\n`);
 });
