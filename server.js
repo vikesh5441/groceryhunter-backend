@@ -30,7 +30,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ── Environment variables (set in Render dashboard) ───────────────────────────
-const SERPER_KEY = process.env.SERPER_API_KEY || 'e79f18b7e72aa89f5f50a31a998d83e536b36ec0;
+const SERPER_KEY = process.env.SERPER_API_KEY || 'e79f18b7e72aa89f5f50a31a998d83e536b36ec0';
   
 const SUPABASE_URL = process.env.SUPABASE_URL    || '';
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
