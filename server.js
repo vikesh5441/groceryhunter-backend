@@ -1,4 +1,3 @@
-
 /**
  * GroceryHunter ZA — Backend v5
  * Uses Serper.dev Google Shopping API (2,500 free queries)
@@ -58,7 +57,7 @@ function matchStore(source) {
 function parsePrice(str) {
   if (!str) return null;
   const n = parseFloat(String(str).replace(/[^\d.]/g,''));
-  return isNaN(n) || n < 2 || n > 5000 ? null : Math.round(n * 100) / 100;
+  return isNaN(n) || n < 2 || n > 800 ? null : Math.round(n * 100) / 100; // Max R800 for groceries
 }
 
 function emptyResults() {
@@ -98,7 +97,7 @@ async function searchGoogleShopping(query) {
     const { data } = await axios.post(
       'https://google.serper.dev/shopping',
       {
-        q: `${query} South Africa`,
+        q: `buy ${query} grocery South Africa price`,
         gl: 'za',       // Country: South Africa
         hl: 'en',       // Language: English
         num: 20,        // Get up to 20 results
@@ -128,7 +127,8 @@ async function searchGoogleShopping(query) {
       if (!price) return;
 
       // Only add if we don't have this store yet (first result = best/most relevant)
-      if (results[storeId].length === 0) {
+      // Extra sanity check: reject prices over R500 for common grocery items
+      if (results[storeId].length === 0 && price <= 500) {
         results[storeId].push({
           name: (item.title || query).slice(0, 80),
           price,
@@ -139,6 +139,8 @@ async function searchGoogleShopping(query) {
         });
         matched++;
         console.log(`  ✅ ${storeId}: R${price} — ${item.title?.slice(0,40)}`);
+      } else if (price > 500) {
+        console.log(`  ⚠️ Rejected ${storeId}: R${price} — too high for grocery item`);
       }
     });
 
@@ -401,5 +403,3 @@ app.listen(PORT, () => {
   console.log(`   POST /submit  { product_name, store_id, price, city }`);
   console.log(`   POST /ai-prices { items:[], apiKey:'' }\n`);
 });
-
-
