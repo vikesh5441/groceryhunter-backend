@@ -30,7 +30,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ── Environment variables (set in Render dashboard) ───────────────────────────
-const SERPER_KEY = process.env.SERPER_API_KEY || 'e79f18b7e72aa89f5f50a31a998d83e536b36ec0';
+const SERPER_KEY   = process.env.SERPER_API_KEY  || 'e79f18b7e72aa89f5f50a31a998d83e536b36ec0';
 const SUPABASE_URL = process.env.SUPABASE_URL    || '';
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
 
@@ -56,8 +56,13 @@ function matchStore(source) {
 
 function parsePrice(str) {
   if (!str) return null;
-  const n = parseFloat(String(str).replace(/[^\d.]/g,''));
-  return isNaN(n) || n < 2 || n > 800 ? null : Math.round(n * 100) / 100; // Max R800 for groceries
+  // Handle both "R 36,99" (Serper SA format) and "R36.99" formats
+  let cleaned = String(str)
+    .replace(/R\s*/gi, '')   // Remove R prefix
+    .replace(',', '.')        // Replace comma with dot (SA decimal format)
+    .replace(/[^\d.]/g, ''); // Remove any other non-numeric chars
+  const n = parseFloat(cleaned);
+  return isNaN(n) || n < 2 || n > 800 ? null : Math.round(n * 100) / 100;
 }
 
 function emptyResults() {
@@ -97,11 +102,12 @@ async function searchGoogleShopping(query) {
     const { data } = await axios.post(
       'https://google.serper.dev/shopping',
       {
-        q: `buy ${query} grocery South Africa price`,
-        gl: 'za',       // Country: South Africa
-        hl: 'en',       // Language: English
-        num: 20,        // Get up to 20 results
+        q: `${query} price`,
+        gl: 'za',          // Country: South Africa
+        hl: 'en',          // Language: English
+        num: 20,
         autocorrect: true,
+        location: 'Durban, KwaZulu-Natal, South Africa',
       },
       {
         headers: {
